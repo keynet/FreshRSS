@@ -15,11 +15,11 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			// Token is useful in the case that anonymous refresh is forbidden
 			// and CRON task cannot be used with php command so the user can
 			// set a CRON task to refresh his feeds by using token inside url
-			$token = FreshRSS_Context::$user_conf->token;
+			$token = FreshRSS_Context::userConf()->token;
 			$token_param = Minz_Request::paramString('token');
 			$token_is_ok = ($token != '' && $token == $token_param);
 			$action = Minz_Request::actionName();
-			$allow_anonymous_refresh = FreshRSS_Context::$system_conf->allow_anonymous_refresh;
+			$allow_anonymous_refresh = FreshRSS_Context::systemConf()->allow_anonymous_refresh;
 			if ($action !== 'actualize' ||
 					!($allow_anonymous_refresh || $token_is_ok)) {
 				Minz_Error::error(403);
@@ -45,7 +45,7 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 
 		$url = trim($url);
 
-		/** @var string|null $url */
+		/** @var string|null $urlHooked */
 		$urlHooked = Minz_ExtensionManager::callHook('check_url_before_add', $url);
 		if ($urlHooked === null) {
 			throw new FreshRSS_FeedNotAdded_Exception($url);
@@ -64,7 +64,6 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 		if ($cat === null) {
 			$catDAO->checkDefault();
 		}
-		$cat_id = $cat === null ? FreshRSS_CategoryDAO::DEFAULTCATEGORYID : $cat->id();
 
 		$feed = new FreshRSS_Feed($url);	//Throws FreshRSS_BadUrl_Exception
 		$title = trim($title);
@@ -72,9 +71,13 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			$feed->_name($title);
 		}
 		$feed->_kind($kind);
-		$feed->_attributes('', $attributes);
+		$feed->_attributes($attributes);
 		$feed->_httpAuth($http_auth);
-		$feed->_categoryId($cat_id);
+		if ($cat === null) {
+			$feed->_categoryId(FreshRSS_CategoryDAO::DEFAULTCATEGORYID);
+		} else {
+			$feed->_category($cat);
+		}
 		switch ($kind) {
 			case FreshRSS_Feed::KIND_RSS:
 			case FreshRSS_Feed::KIND_RSS_FORCED:
@@ -151,7 +154,7 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			'params' => [],
 		];
 
-		$limits = FreshRSS_Context::$system_conf->limits;
+		$limits = FreshRSS_Context::systemConf()->limits;
 		$this->view->feeds = $feedDAO->listFeeds();
 		if (count($this->view->feeds) >= $limits['max_feeds']) {
 			Minz_Request::bad(_t('feedback.sub.feed.over_max', $limits['max_feeds']), $url_redirect);
@@ -361,10 +364,23 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			}
 		} else {
 			$feeds = $feedDAO->listFeedsOrderUpdate(-1);
+
+			// Hydrate category for each feed to avoid that each feed has to make an SQL request
+			$categories = [];
+			$catDAO = FreshRSS_Factory::createCategoryDao();
+			foreach ($catDAO->listCategories(false, false) as $category) {
+				$categories[$category->id()] = $category;
+			}
+			foreach ($feeds as $feed) {
+				$category = $categories[$feed->categoryId()] ?? null;
+				if ($category !== null) {
+					$feed->_category($category);
+				}
+			}
 		}
 
 		// WebSub (PubSubHubbub) support
-		$pubsubhubbubEnabledGeneral = FreshRSS_Context::$system_conf->pubsubhubbub_enabled;
+		$pubsubhubbubEnabledGeneral = FreshRSS_Context::systemConf()->pubsubhubbub_enabled;
 		$pshbMinAge = time() - (3600 * 24);  //TODO: Make a configuration.
 
 		$updated_feeds = 0;
@@ -393,14 +409,14 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			$mtime = $feed->cacheModifiedTime() ?: 0;
 			$ttl = $feed->ttl();
 			if ($ttl === FreshRSS_Feed::TTL_DEFAULT) {
-				$ttl = FreshRSS_Context::$user_conf->ttl_default;
+				$ttl = FreshRSS_Context::userConf()->ttl_default;
 			}
 			if ($simplePiePush === null && $feed_id === null && (time() <= $feed->lastUpdate() + $ttl)) {
 				//Too early to refresh from source, but check whether the feed was updated by another user
 				$ε = 10;	// negligible offset errors in seconds
 				if ($mtime <= 0 ||
 					$feed->lastUpdate() + $ε >= $mtime ||
-					time() + $ε >= $mtime + FreshRSS_Context::$system_conf->limits['cache_duration']) {	// is cache still valid?
+					time() + $ε >= $mtime + FreshRSS_Context::systemConf()->limits['cache_duration']) {	// is cache still valid?
 					continue;	//Nothing newer from other users
 				}
 				Minz_Log::debug('Feed ' . $feed->url(false) . ' was updated at ' . date('c', $feed->lastUpdate()) .
@@ -462,17 +478,20 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			$nbMarkedUnread = 0;
 
 			if (count($newGuids) > 0) {
-				$titlesAsRead = [];
-				$readWhenSameTitleInFeed = $feed->attributes('read_when_same_title_in_feed');
-				if ($readWhenSameTitleInFeed == false) {
-					$readWhenSameTitleInFeed = FreshRSS_Context::$user_conf->mark_when['same_title_in_feed'];
+				if ($feed->attributeBoolean('read_when_same_title_in_feed') === null) {
+					$readWhenSameTitleInFeed = (int)FreshRSS_Context::userConf()->mark_when['same_title_in_feed'];
+				} elseif ($feed->attributeBoolean('read_when_same_title_in_feed') === false) {
+					$readWhenSameTitleInFeed = 0;
+				} else {
+					$readWhenSameTitleInFeed = $feed->attributeInt('read_when_same_title_in_feed') ?? 0;
 				}
 				if ($readWhenSameTitleInFeed > 0) {
-					/** @var array<string,bool> $titlesAsRead*/
-					$titlesAsRead = array_flip($feedDAO->listTitles($feed->id(), (int)$readWhenSameTitleInFeed));
+					$titlesAsRead = array_flip($feedDAO->listTitles($feed->id(), $readWhenSameTitleInFeed));
+				} else {
+					$titlesAsRead = [];
 				}
 
-				$mark_updated_article_unread = $feed->attributes('mark_updated_article_unread') ?? FreshRSS_Context::$user_conf->mark_updated_article_unread;
+				$mark_updated_article_unread = $feed->attributeBoolean('mark_updated_article_unread') ?? FreshRSS_Context::userConf()->mark_updated_article_unread;
 
 				// For this feed, check existing GUIDs already in database.
 				$existingHashForGuids = $entryDAO->listHashForFeedGuids($feed->id(), $newGuids) ?: [];
@@ -660,29 +679,81 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 		return [$updated_feeds, reset($feeds) ?: null, $nb_new_articles];
 	}
 
-	public static function commitNewEntries(): bool {
-		$entryDAO = FreshRSS_Factory::createEntryDao();
-		if (!$entryDAO->inTransaction()) {
-			$entryDAO->beginTransaction();
-		}
-
-		$newUnreadEntriesPerFeed = $entryDAO->newUnreadEntriesPerFeed();
-		if ($entryDAO->commitNewEntries()) {
-			$feedDAO = FreshRSS_Factory::createFeedDao();
-			$feeds = $feedDAO->listFeedsOrderUpdate(-1);
-			foreach ($feeds as $feed) {
-				if (!empty($newUnreadEntriesPerFeed[$feed->id()]) && $feed->keepMaxUnread() !== null &&
-					($feed->nbNotRead() + $newUnreadEntriesPerFeed[$feed->id()] > $feed->keepMaxUnread())) {
-					Minz_Log::debug('New unread entries (' . ($feed->nbNotRead() + $newUnreadEntriesPerFeed[$feed->id()]) . ') exceeding max number of ' .
-						$feed->keepMaxUnread() .  ' for [' . $feed->url(false) . ']');
-					$feed->markAsReadMaxUnread();
+	/**
+	 * @param array<int,int> $newUnreadEntriesPerFeed
+	 * @return int|false The number of articles marked as read, of false if error
+	 */
+	private static function keepMaxUnreads(array $newUnreadEntriesPerFeed) {
+		$affected = 0;
+		$feedDAO = FreshRSS_Factory::createFeedDao();
+		$feeds = $feedDAO->listFeedsOrderUpdate(-1);
+		foreach ($feeds as $feed) {
+			if (!empty($newUnreadEntriesPerFeed[$feed->id()]) && $feed->keepMaxUnread() !== null &&
+				($feed->nbNotRead() + $newUnreadEntriesPerFeed[$feed->id()] > $feed->keepMaxUnread())) {
+				Minz_Log::debug('New unread entries (' . ($feed->nbNotRead() + $newUnreadEntriesPerFeed[$feed->id()]) . ') exceeding max number of ' .
+					$feed->keepMaxUnread() .  ' for [' . $feed->url(false) . ']');
+				$n = $feed->markAsReadMaxUnread();
+				if ($n === false) {
+					$affected = false;
+					break;
+				} else {
+					$affected += $n;
 				}
 			}
-			$feedDAO->updateCachedValues();
+		}
+		if ($feedDAO->updateCachedValues() === false) {
+			$affected = false;
+		}
+		return $affected;
+	}
+
+	/**
+	 * Auto-add labels to new articles.
+	 * @param int $nbNewEntries The number of top recent entries to process.
+	 * @return int|false The number of new labels added, or false in case of error.
+	 */
+	private static function applyLabelActions(int $nbNewEntries) {
+		$tagDAO = FreshRSS_Factory::createTagDao();
+		$labels = $tagDAO->listTags() ?: [];
+		$labels = array_filter($labels, static function (FreshRSS_Tag $label) {
+			return !empty($label->filtersAction('label'));
+		});
+		if (count($labels) <= 0) {
+			return 0;
 		}
 
-		if ($entryDAO->inTransaction()) {
-			$entryDAO->commit();
+		$entryDAO = FreshRSS_Factory::createEntryDao();
+		/** @var array<array{id_tag:int,id_entry:string}> $applyLabels */
+		$applyLabels = [];
+		foreach (FreshRSS_Entry::fromTraversable($entryDAO->selectAll($nbNewEntries)) as $entry) {
+			foreach ($labels as $label) {
+				$label->applyFilterActions($entry, $applyLabel);
+				if ($applyLabel) {
+					$applyLabels[] = [
+						'id_tag' => $label->id(),
+						'id_entry' => $entry->id(),
+					];
+				}
+			}
+		}
+		return $tagDAO->tagEntries($applyLabels);
+	}
+
+	public static function commitNewEntries(): bool {
+		$entryDAO = FreshRSS_Factory::createEntryDao();
+		$newUnreadEntriesPerFeed = $entryDAO->newUnreadEntriesPerFeed();
+		$nbNewEntries = array_sum($newUnreadEntriesPerFeed);
+		if ($nbNewEntries > 0) {
+			if (!$entryDAO->inTransaction()) {
+				$entryDAO->beginTransaction();
+			}
+			if ($entryDAO->commitNewEntries()) {
+				self::keepMaxUnreads($newUnreadEntriesPerFeed);
+				self::applyLabelActions($nbNewEntries);
+			}
+			if ($entryDAO->inTransaction()) {
+				$entryDAO->commit();
+			}
 		}
 
 		$databaseDAO = FreshRSS_Factory::createDatabaseDAO();
@@ -815,10 +886,10 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 			// TODO: Delete old favicon
 
 			// Remove related queries
-			FreshRSS_Context::$user_conf->queries = remove_query_by_get(
-				'f_' . $feed_id, FreshRSS_Context::$user_conf->queries);
-			FreshRSS_Context::$user_conf->save();
-
+			/** @var array<array{'get'?:string,'name'?:string,'order'?:string,'search'?:string,'state'?:int,'url'?:string}> $queries */
+			$queries = remove_query_by_get('f_' . $feed_id, FreshRSS_Context::userConf()->queries);
+			FreshRSS_Context::userConf()->queries = $queries;
+			FreshRSS_Context::userConf()->save();
 			return true;
 		}
 		return false;
@@ -926,7 +997,7 @@ class FreshRSS_feed_Controller extends FreshRSS_ActionController {
 
 		//We need another DB connection in parallel for unbuffered streaming
 		Minz_ModelPdo::$usesSharedPdo = false;
-		if (FreshRSS_Context::$system_conf->db['type'] === 'mysql') {
+		if (FreshRSS_Context::systemConf()->db['type'] === 'mysql') {
 			// Second parallel connection for unbuffered streaming: MySQL
 			$entryDAO2 = FreshRSS_Factory::createEntryDao();
 		} else {

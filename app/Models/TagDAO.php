@@ -96,11 +96,12 @@ SQL;
 	}
 
 	/**
+	 * @param non-empty-string $key
 	 * @param mixed $value
 	 * @return int|false
 	 */
 	public function updateTagAttribute(FreshRSS_Tag $tag, string $key, $value) {
-		$tag->_attributes($key, $value);
+		$tag->_attribute($key, $value);
 		return $this->updateTagAttributes($tag->id(), $tag->attributes());
 	}
 
@@ -134,6 +135,7 @@ SQL;
 			return;
 		}
 		while ($row = $stm->fetch(PDO::FETCH_ASSOC)) {
+			/** @var array{'id':int,'name':string,'attributes'?:array<string,mixed>} $row */
 			yield $row;
 		}
 	}
@@ -299,6 +301,35 @@ SQL;
 	}
 
 	/**
+	 * @param array<array{id_tag:int,id_entry:string}> $addLabels Labels to insert as batch
+	 * @return int|false Number of new entries or false in case of error
+	 */
+	public function tagEntries(array $addLabels) {
+		$hasValues = false;
+		$sql = 'INSERT ' . $this->sqlIgnore() . ' INTO `_entrytag`(id_tag, id_entry) VALUES ';
+		foreach ($addLabels as $addLabel) {
+			$id_tag = (int)($addLabel['id_tag'] ?? 0);
+			$id_entry = $addLabel['id_entry'] ?? '';
+			if ($id_tag > 0 && ctype_digit($id_entry)) {
+				$sql .= "({$id_tag},{$id_entry}),";
+				$hasValues = true;
+			}
+		}
+		$sql = rtrim($sql, ',');
+		if (!$hasValues) {
+			return false;
+		}
+
+		$affected = $this->pdo->exec($sql);
+		if ($affected !== false) {
+			return $affected;
+		}
+		$info = $this->pdo->errorInfo();
+		Minz_Log::error('SQL error ' . __METHOD__ . json_encode($info));
+		return false;
+	}
+
+	/**
 	 * @return array<int,array{'id':int,'name':string,'id_entry':string,'checked':bool}>|false
 	 */
 	public function getTagsForEntry(string $id_entry) {
@@ -410,7 +441,7 @@ SQL;
 			$tag = new FreshRSS_Tag($dao['name']);
 			$tag->_id($dao['id']);
 			if (!empty($dao['attributes'])) {
-				$tag->_attributes('', $dao['attributes']);
+				$tag->_attributes($dao['attributes']);
 			}
 			if (isset($dao['unreads'])) {
 				$tag->_nbUnread($dao['unreads']);
